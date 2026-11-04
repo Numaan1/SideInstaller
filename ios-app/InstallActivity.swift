@@ -413,21 +413,13 @@ final class InstallActivity {
         // A task iOS only queues would start after the user stopped waiting.
         request.strategy = .fail
         taskID = identifier
-        if #available(iOS 27.0, *) {
-            // Not from the main thread, the header says.
-            Task.detached { [weak self] in
-                do {
-                    try await BGTaskScheduler.shared.submitTaskRequest(request)
-                } catch {
-                    await self?.taskRefused(identifier, error)
-                }
-            }
-        } else {
-            do {
-                try BGTaskScheduler.shared.submit(request)
-            } catch {
-                taskRefused(identifier, error)
-            }
+        // The async submitTaskRequest(_:) needs the iOS 27 SDK headers to
+        // type-check even behind an availability guard, so building with Xcode 26
+        // uses the sync one. It's deprecated on iOS 27, not removed.
+        do {
+            try BGTaskScheduler.shared.submit(request)
+        } catch {
+            taskRefused(identifier, error)
         }
         return true
     }
