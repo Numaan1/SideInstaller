@@ -1878,19 +1878,19 @@ final class Engine: ObservableObject {
 
     /// Deletes a picked file only if it's in this app's temp directory (the
     /// picker's copy). Files opened in place are left alone.
-    private static func discardInboxCopy(_ url: URL) {
+    static func discardInboxCopy(_ url: URL) {
         let tmp = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().path
         guard url.resolvingSymlinksInPath().path.hasPrefix(tmp + "/") else { return }
         try? FileManager.default.removeItem(at: url)
     }
 
-    /// Copies a picked IPA into the custom import slot on a background queue.
-    private static func copyImport(from url: URL) async throws -> URL {
+    /// Copies a picked IPA into an import folder on a background queue.
+    static func copyImport(from url: URL, into dir: URL = IPALibrary.customDir) async throws -> URL {
         try await withCheckedThrowingContinuation { cont in
             DispatchQueue.global(qos: .userInitiated).async {
                 let scoped = url.startAccessingSecurityScopedResource()
                 defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-                do { cont.resume(returning: try IPALibrary.replaceCustomImport(with: url)) }
+                do { cont.resume(returning: try IPALibrary.replaceCustomImport(with: url, into: dir)) }
                 catch { cont.resume(throwing: error) }
             }
         }

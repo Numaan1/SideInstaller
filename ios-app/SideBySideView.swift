@@ -22,11 +22,30 @@ enum SideBySideStep: Int, CaseIterable, Identifiable {
         case .install:  return L("Install on their iPhone")
         }
     }
+
+    /// The download row when an app chosen here installs instead of
+    /// SideInstaller's release; every other row says the same either way.
+    func title(installingOwnIPA: Bool) -> String {
+        if self == .download && installingOwnIPA {
+            return L("Take the .ipa you chose")
+        }
+        return title
+    }
+}
+
+/// What a Side by Side run puts on their iPhone.
+enum SideBySideApp: Hashable {
+    /// SideInstaller's own latest release: what makes their iPhone able to pair
+    /// itself and renew from then on, so the default.
+    case release
+    /// An IPA picked on this page, installed instead.
+    case chosen
 }
 
 // MARK: - Manager
 
-/// Installs SideInstaller onto *another* iPhone on the same Wi-Fi network.
+/// Installs an app onto *another* iPhone on the same Wi-Fi network — by default
+/// SideInstaller itself, or whichever IPA was chosen on the page.
 ///
 /// Same flow as the Install tab, but over the LAN:
 ///
@@ -58,6 +77,10 @@ final class SideBySideManager: ObservableObject {
     /// What the release asset is called, and what the download is saved as.
     static let ipaFileName = "SideInstaller.ipa"
 
+    /// Where an IPA chosen for their iPhone is staged. Kept apart from the
+    /// Install tab's Custom .ipa so neither run overwrites the other's file.
+    static let chosenIPAStaging = IPALibrary.peerDir
+
     // MARK: Inputs
 
     /// The other iPhone's address on this Wi-Fi network. Optional: pairing from
@@ -66,6 +89,11 @@ final class SideBySideManager: ObservableObject {
     /// The Apple ID the app is signed with. Never persisted — see the note above.
     @Published var appleID = ""
     @Published var password = ""
+    /// SideInstaller's release, or the IPA chosen below.
+    @Published var app: SideBySideApp = .release
+    /// A link to an `.ipa`, staged as the pick by the link field's download
+    /// button. Emptied once the file is in.
+    @Published var chosenIPALink = ""
 
     // MARK: State
 
@@ -79,6 +107,15 @@ final class SideBySideManager: ObservableObject {
     @Published private(set) var downloadProgress: Double = 0
     /// Home-screen name of what landed on their iPhone.
     @Published private(set) var installedAppName: String?
+    /// The IPA chosen to install instead of the release, once it's staged.
+    @Published private(set) var chosenIPAName: String?
+    /// Its size in bytes, shown under the name.
+    @Published private(set) var chosenIPASize: Int = 0
+    /// True while a picked file is copied in, or a linked one downloads.
+    @Published private(set) var isFetchingIPA = false
+    /// How much of a linked download has arrived (0…1); nil for a file copy,
+    /// which reports no fraction.
+    @Published private(set) var chosenIPAProgress: Double?
     /// True while their iPhone has to pair from its own Settings, which it
     /// never prompts for by itself.
     @Published private(set) var pairingInSettings = false
@@ -107,6 +144,9 @@ final class SideBySideManager: ObservableObject {
     /// The downloaded IPA, kept between runs so a retry after a signing failure
     /// doesn't fetch it again. Its staging directory is ours to delete.
     private var downloadedIPA: URL?
+    /// The IPA chosen for their iPhone, staged under `Self.chosenIPAStaging` so
+    /// it survives a retry, and a relaunch of the app.
+    private var chosenIPA: URL?
     private var signedAppPath: String?
     private var targetUDID: String?
     private var targetName: String?
@@ -114,6 +154,10 @@ final class SideBySideManager: ObservableObject {
     private var askedLocalNetwork = false
 
     private var engine: Engine { Engine.shared }
+
+    init() {
+        reloadChosenIPA()
+    }
 
     deinit {
         if let signSession { si_sign_session_free(signSession) }
@@ -124,9 +168,10 @@ final class SideBySideManager: ObservableObject {
     // MARK: - Derived
 
     /// True when there is enough on the page to start a run. The address is
-    /// optional; see `targetIP`.
+    /// optional; see `targetIP`. A chosen IPA has to be on disk, not just asked
+    /// for.
     var canRun: Bool {
-        !Self.tidy(appleID).isEmpty && !password.isEmpty
+        !Self.tidy(appleID).isEmpty && !password.isEmpty && (app == .release || chosenIPA != nil)
     }
 
     /// This iPhone's Wi-Fi address, shown as an example of what theirs looks like.
@@ -725,11 +770,112 @@ final class SideBySideManager: ObservableObject {
         }
     }
 
+    // MARK: - The IPA to install
+
+    /// Re-read the staged IPA from disk, so a pick survives a relaunch.
+    private func reloadChosenIPA() {
+        guard let entry = IPALibrary.imported(in: Self.chosenIPAStaging),
+              IPALibrary.looksLikeIPA(entry.url) else { return }
+        chosenIPA = entry.url
+        chosenIPAName = entry.url.lastPathComponent
+        chosenIPASize = entry.size
+    }
+
+    /// Stage a `.ipa` picked from Files as the app to install, replacing the
+    /// previous pick.
+    @MainActor
+    func chooseIPA(from url: URL) async {
+        guard !isFetchingIPA else { return }
+        isFetchingIPA = true
+        chosenIPAProgress = nil
+        // Delete the picker's temporary copy once the import is done.
+        defer { isFetchingIPA = false; Engine.discardInboxCopy(url) }
+        do {
+            let dest = try await Engine.copyImport(from: url, into: Self.chosenIPAStaging)
+            showChosenIPA(dest)
+            engine.log("Side by Side: will install \(dest.lastPathComponent) on their iPhone.")
+        } catch IPALibrary.ImportError.notAnIPA {
+            // Validation runs on a staged copy, so the previous pick survives.
+            reloadChosenIPA()
+            lastError = ErrorHelp.explained(L("%@ isn't an IPA. Pick the .ipa file itself — if it looks right, the download may have saved an error page instead, or stopped partway.",
+                                              url.lastPathComponent))
+            engine.log("⛔️ Side by Side import: \(lastError ?? "")")
+        } catch is CancellationError {
+            reloadChosenIPA()
+            engine.log("Side by Side import cancelled.")
+        } catch {
+            reloadChosenIPA()
+            lastError = L("Couldn't import %@: %@", url.lastPathComponent, error.localizedDescription)
+            engine.log("⛔️ Side by Side import: \(lastError ?? "")")
+        }
+    }
+
+    /// Download the `.ipa` in `chosenIPALink` and stage it as the app to
+    /// install. True once it's in.
+    @MainActor
+    @discardableResult
+    func chooseIPAFromLink() async -> Bool {
+        guard !isFetchingIPA else { return false }
+        guard let link = Engine.downloadLink(chosenIPALink) else {
+            lastError = ErrorHelp.explained(L("That isn't a link SideInstaller can download. Paste the whole https:// address the .ipa downloads from."))
+            engine.log("⛔️ Side by Side import: \(lastError ?? "")")
+            return false
+        }
+        isFetchingIPA = true
+        chosenIPAProgress = 0
+        defer { isFetchingIPA = false; chosenIPAProgress = nil }
+        do {
+            let downloaded = try await SideStoreDownloader.fetchDirect(
+                link, named: Engine.importFileName(for: link)) { fraction in
+                    Task { @MainActor in self.chosenIPAProgress = fraction }
+                }
+            // The download lives in its own staging directory; remove all of it.
+            defer { try? FileManager.default.removeItem(at: downloaded.deletingLastPathComponent()) }
+            let dest = try await Engine.copyImport(from: downloaded, into: Self.chosenIPAStaging)
+            showChosenIPA(dest)
+            chosenIPALink = ""
+            engine.log("Side by Side: will install \(dest.lastPathComponent) on their iPhone.")
+            return true
+        } catch IPALibrary.ImportError.notAnIPA {
+            lastError = ErrorHelp.explained(L("That link didn't return an IPA. It has to download the file itself — a page that only links to the .ipa, or one that asks you to sign in first, arrives here as a web page."))
+            engine.log("⛔️ Side by Side import: \(lastError ?? "")")
+        } catch is CancellationError {
+            reloadChosenIPA()
+            engine.log("Side by Side import cancelled.")
+        } catch {
+            lastError = L("Couldn't download that link: %@", short(error))
+            engine.log("⛔️ Side by Side import: \(lastError ?? "")")
+        }
+        return false
+    }
+
+    /// Stop installing the chosen IPA and delete the file it staged. The Install
+    /// tab's Custom .ipa is a different file, and stays.
+    @MainActor
+    func forgetChosenIPA() {
+        guard !isRunning, let file = chosenIPA else { return }
+        try? FileManager.default.removeItem(at: file.deletingLastPathComponent())
+        chosenIPA = nil
+        chosenIPAName = nil
+        chosenIPASize = 0
+        app = .release
+        engine.log("Side by Side: forgot \(file.lastPathComponent).")
+    }
+
+    /// Show a freshly staged IPA as the pick, with its size.
+    @MainActor
+    private func showChosenIPA(_ url: URL) {
+        chosenIPA = url
+        chosenIPAName = url.lastPathComponent
+        chosenIPASize = fileSize(url.path)
+    }
+
     // MARK: - Step 3: fetch the release build
 
     @MainActor
     private func download() async throws {
         try Task.checkCancellation()
+        guard app == .release else { return try useChosenIPA() }
         if let existing = downloadedIPA, FileManager.default.fileExists(atPath: existing.path) {
             engine.log("SideInstaller IPA already downloaded — skipping.")
             setStep(.download, .done)
@@ -758,6 +904,19 @@ final class SideBySideManager: ObservableObject {
         }
     }
 
+    /// Take the IPA chosen on the page as the download step's result. It's
+    /// already on this iPhone, so nothing is fetched.
+    @MainActor
+    private func useChosenIPA() throws {
+        setStep(.download, .active)
+        guard let ipa = chosenIPA, IPALibrary.looksLikeIPA(ipa) else {
+            throw EngineError.message(L("Choose the .ipa to install first, or pick SideInstaller's release instead."))
+        }
+        downloadProgress = 1
+        engine.log("Installing \(ipa.lastPathComponent) on their iPhone — it's already here, so nothing downloads.")
+        setStep(.download, .done)
+    }
+
     /// Delete the downloaded IPA and the staging directory it lives in.
     private func discardDownload() {
         guard let file = downloadedIPA else { return }
@@ -771,7 +930,15 @@ final class SideBySideManager: ObservableObject {
     private func signApp() async throws {
         try Task.checkCancellation()
         guard let session = signSession else { throw EngineError.message(L("Not signed in.")) }
-        guard let ipa = downloadedIPA else { throw EngineError.message(L("No SideInstaller IPA downloaded.")) }
+        let ipa: URL
+        switch app {
+        case .release:
+            guard let file = downloadedIPA else { throw EngineError.message(L("No SideInstaller IPA downloaded.")) }
+            ipa = file
+        case .chosen:
+            guard let file = chosenIPA else { throw EngineError.message(L("No .ipa chosen to install.")) }
+            ipa = file
+        }
         // Their UDID is registered with the team before the profile is asked
         // for, or Apple refuses it with error 8220.
         let udid = targetUDID ?? ""
@@ -779,23 +946,38 @@ final class SideBySideManager: ObservableObject {
         if udid.isEmpty {
             engine.log("⚠️ No UDID captured from their iPhone — signing may fail with error 8220.")
         }
+        // SideInstaller wants neither more memory nor a bundled pairing file. An
+        // app chosen here is signed the way the Install tab signs it: Increased
+        // Memory Limit where Apple allows it, required for Madeira, which renews
+        // its own profile and so gets no app group.
+        let forMadeira = app == .chosen && Self.isMadeira(ipa)
+        let memoryLimit: Int32 = app == .release ? 0 : (forMadeira ? 1 : 2)
+        let appGroup: Int32 = forMadeira ? 0 : 1
         setStep(.sign, .active)
         let path = try await onSignQueue {
-            try self.performSign(session: session, ipa: ipa.path, udid: udid, deviceName: name)
+            try self.performSign(session: session, ipa: ipa.path, udid: udid, deviceName: name,
+                                 memoryLimit: memoryLimit, appGroup: appGroup)
         }
         signedAppPath = path
-        installedAppName = Self.displayName(ofBundleAt: path) ?? "SideInstaller"
+        installedAppName = Self.displayName(ofBundleAt: path) ?? ipa.deletingPathExtension().lastPathComponent
         setStep(.sign, .done)
     }
 
+    /// True when the IPA at `url` is Madeira, told by its bundle id.
+    private static func isMadeira(_ url: URL) -> Bool {
+        IPALibrary.appInfo(at: url).map { MadeiraPairingHandoff.isMadeira(bundleID: $0.bundleID) } ?? false
+    }
+
     private func performSign(session: OpaquePointer, ipa: String,
-                             udid: String, deviceName: String) throws -> String {
+                             udid: String, deviceName: String,
+                             memoryLimit: Int32, appGroup: Int32) throws -> String {
         engine.log("Signing \(ipa) for \(udid.isEmpty ? "their iPhone" : udid) …")
         var signed: UnsafeMutablePointer<CChar>?
         var error: UnsafeMutablePointer<CChar>?
-        // SideInstaller has no use for a bundled pairing file, or for more
-        // memory; it gets its app group like any app.
-        let rc = si_sign_ipa(session, ipa, udid, deviceName, nil, 0, 1, &signed, &error)
+        // No pairing file is bundled for Remote AltServer: it would be this
+        // iPhone's own record, not one for their device.
+        let rc = si_sign_ipa(session, ipa, udid, deviceName, nil, memoryLimit, appGroup,
+                             &signed, &error)
         if rc == 0 {
             let path = signed.map { String(cString: $0) } ?? ""
             signed.map { si_string_free($0) }
@@ -927,7 +1109,8 @@ private let sideBySideTwoFactorCallback: SITwoFactorCb = { _, request, outBuf, b
 
 // MARK: - View
 
-/// Installs SideInstaller onto somebody else's iPhone across the Wi-Fi network.
+/// Installs an app onto somebody else's iPhone across the Wi-Fi network —
+/// SideInstaller's own release, or an IPA chosen on this page.
 /// Pushed from Tools, whose `NavigationStack` this relies on.
 struct SideBySideView: View {
     /// Observed so labels redraw when the language changes.
@@ -939,18 +1122,20 @@ struct SideBySideView: View {
     @ObservedObject var manager: SideBySideManager
 
     @State private var showSettings = false
+    @State private var showIPAImporter = false
     @FocusState private var focus: Field?
 
-    private enum Field: Hashable { case address, email, password }
+    private enum Field: Hashable { case address, email, password, ipaLink }
 
     var body: some View {
         ScrollView {
             VStack(spacing: 18) {
                 header.cascadeItem(0)
                 targetCard.cascadeItem(1)
-                accountCard.cascadeItem(2)
-                stepsCard.cascadeItem(3)
-                actionButton.cascadeItem(4)
+                appCard.cascadeItem(2)
+                accountCard.cascadeItem(3)
+                stepsCard.cascadeItem(4)
+                actionButton.cascadeItem(5)
                 // The pairing steps and code, errors and success show as
                 // `SideBySidePopup`, which `RootView` lays over the app.
             }
@@ -963,6 +1148,13 @@ struct SideBySideView: View {
         .background(AppBackground())
         .toolbar { settingsToolbarItem(isPresented: $showSettings) }
         .sheet(isPresented: $showSettings) { SettingsView() }
+        .sheet(isPresented: $showIPAImporter) {
+            FileImporterRepresentableView(allowedContentTypes: [.ipa]) { urls in
+                guard let url = urls.first else { return }   // empty means cancelled
+                Task { await manager.chooseIPA(from: url) }
+            }
+            .ignoresSafeArea()
+        }
         .scrollDismissesKeyboard(.interactively)
     }
 
@@ -990,17 +1182,12 @@ struct SideBySideView: View {
         PanelCard {
             VStack(alignment: .leading, spacing: 12) {
                 sectionTitle(L("Their iPhone"), systemImage: "iphone")
-                // Their iPhone needs iOS 27+ so the installed app can pair itself.
-                // This can't be checked before the run.
-                HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundStyle(.orange)
-                    Text(L("Their iPhone needs iOS %@ — SideInstaller pairs itself once it's installed, and nothing older can.",
-                           Engine.minimumOSText))
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .font(.caption)
+                // Their iPhone needs iOS 27+ so the installed SideInstaller can
+                // pair itself. This can't be checked before the run.
+                warningNote(manager.app == .release
+                            ? L("Their iPhone needs iOS %@ — SideInstaller pairs itself once it's installed, and nothing older can.",
+                                Engine.minimumOSText)
+                            : L("An app you choose here is signed for their iPhone but can't pair itself afterwards — install SideInstaller on it first if it has nothing on it yet."))
                 TextField(L("IP address (optional)"), text: $manager.targetIP)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
@@ -1025,6 +1212,164 @@ struct SideBySideView: View {
         let route = L("On their iPhone: Settings › Wi-Fi › ⓘ next to the network, then “IP Address”.")
         guard let own = manager.ownWiFiAddress else { return optional + " " + route }
         return optional + " " + route + " " + L("This iPhone is %@, so theirs will look similar.", own)
+    }
+
+    /// An orange one-line caution, as the cards carry them.
+    private func warningNote(_ text: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+            Text(text)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .font(.caption)
+    }
+
+    // MARK: What installs
+
+    /// The choice between SideInstaller's own release and an IPA picked here.
+    /// Both take the same pairing, sign-in, signing and install steps; only the
+    /// file and how it's signed differ.
+    private var appCard: some View {
+        PanelCard {
+            VStack(alignment: .leading, spacing: 12) {
+                sectionTitle(L("What installs"), systemImage: "square.stack.3d.up.fill")
+                Picker(L("App"), selection: $manager.app) {
+                    Text("SideInstaller").tag(SideBySideApp.release)
+                    Text(L("My own .ipa")).tag(SideBySideApp.chosen)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .disabled(manager.isRunning)
+
+                if manager.app == .release {
+                    Text(L("The latest release, fetched from GitHub at install time."))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    ipaPickerButton
+                    ipaLinkField
+                    chosenIPACaption
+                }
+            }
+            .animation(.smooth(duration: 0.3), value: manager.app)
+        }
+    }
+
+    /// Opens Files and stages the picked IPA as the app to install.
+    private var ipaPickerButton: some View {
+        Button {
+            focus = nil
+            showIPAImporter = true
+        } label: {
+            HStack(spacing: 8) {
+                if manager.isFetchingIPA {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Image(systemName: manager.chosenIPAName == nil
+                          ? "square.and.arrow.down" : "checkmark.circle.fill")
+                        .contentTransition(.symbolEffect(.replace))
+                        .foregroundStyle(manager.chosenIPAName == nil ? Color.secondary : Theme.accent2)
+                }
+                Text(chosenIPALabel)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .foregroundStyle(.primary)
+                Spacer()
+                if manager.chosenIPAName != nil, !manager.isFetchingIPA {
+                    Text(L("Replace"))
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(Theme.accent2)
+                }
+            }
+            .fieldBackground()
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain, sound: .tap)
+        .disabled(manager.isRunning || manager.isFetchingIPA)
+    }
+
+    /// The button's caption: what a fetch is doing, or which IPA is loaded.
+    private var chosenIPALabel: String {
+        guard manager.isFetchingIPA else { return manager.chosenIPAName ?? L("Import .ipa") }
+        // A file copy reports no fraction; a link download does.
+        guard let fraction = manager.chosenIPAProgress else { return L("Importing…") }
+        return L("Downloading… %d%%", Int(fraction * 100))
+    }
+
+    /// A direct link to an IPA, staged into the same slot as a picked file.
+    private var ipaLinkField: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "link")
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(.secondary)
+            TextField(L("Paste a download link"), text: $manager.chosenIPALink)
+                .textFieldStyle(.plain)
+                .focused($focus, equals: .ipaLink)
+                .keyboardType(.URL)
+                .textContentType(.URL)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .submitLabel(.go)
+                .lineLimit(1)
+                .disabled(manager.isRunning || manager.isFetchingIPA)
+                .onSubmit(fetchChosenIPA)
+            if !manager.chosenIPALink.isEmpty {
+                Button { manager.chosenIPALink = "" } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.tertiary)
+                }
+                .buttonStyle(.plain, sound: .tick)
+            }
+            Button(action: fetchChosenIPA) {
+                Image(systemName: "arrow.down.circle.fill")
+                    .font(.title3)
+                    .foregroundStyle(linkIsUsable ? Theme.accent2 : Color.secondary.opacity(0.5))
+            }
+            .buttonStyle(.plain, sound: .tap)
+            .disabled(!linkIsUsable)
+        }
+        .fieldBackground()
+        .animation(.smooth(duration: 0.25), value: manager.chosenIPAProgress == nil)
+    }
+
+    /// True once the field holds something worth trying to download.
+    private var linkIsUsable: Bool {
+        !manager.isRunning && !manager.isFetchingIPA && Engine.downloadLink(manager.chosenIPALink) != nil
+    }
+
+    private func fetchChosenIPA() {
+        focus = nil
+        Task { await manager.chooseIPAFromLink() }
+    }
+
+    /// The loaded IPA's size, and a way back to the release build.
+    @ViewBuilder
+    private var chosenIPACaption: some View {
+        if let name = manager.chosenIPAName {
+            HStack(spacing: 8) {
+                Text(L("%@ · %@", name,
+                       ByteCountFormatter.string(fromByteCount: Int64(manager.chosenIPASize),
+                                                 countStyle: .file)))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer(minLength: 0)
+                Button(L("Remove")) { manager.forgetChosenIPA() }
+                    .font(.caption.weight(.semibold))
+                    .buttonStyle(.plain, sound: .tap)
+                    .foregroundStyle(.red)
+                    .disabled(manager.isRunning)
+            }
+        } else if !manager.isFetchingIPA {
+            Text(L("Nothing chosen yet — import an .ipa, or paste a link to one."))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
     }
 
     // MARK: The Apple ID
@@ -1077,7 +1422,7 @@ struct SideBySideView: View {
             VStack(alignment: .leading, spacing: 14) {
                 sectionTitle(L("Steps"), systemImage: "list.bullet")
                 ForEach(SideBySideStep.allCases) { step in
-                    SideBySideStepRow(title: step.title,
+                    SideBySideStepRow(title: step.title(installingOwnIPA: manager.app == .chosen),
                                       state: manager.stepStates[step] ?? .pending,
                                       detail: detail(for: step))
                 }

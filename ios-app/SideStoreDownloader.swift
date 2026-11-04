@@ -1575,6 +1575,12 @@ enum IPALibrary {
         documentsDir.appendingPathComponent("Custom", isDirectory: true)
     }
 
+    /// Folder for the IPA Side by Side installs onto someone else's iPhone. Kept
+    /// apart from the Install tab's import so neither overwrites the other.
+    static var peerDir: URL {
+        documentsDir.appendingPathComponent("SideBySide", isDirectory: true)
+    }
+
     /// One `.ipa` in Documents, tagged with the build its name identifies.
     struct Entry {
         let source: InstallSource
@@ -1623,7 +1629,13 @@ enum IPALibrary {
 
     /// The imported IPA, if there is one; the newest wins if a stale one survives.
     static func customImport() -> Entry? {
-        describe(namesIn: customDir)
+        imported(in: customDir)
+    }
+
+    /// The newest `.ipa` in `dir`, told apart by the file's attributes; nil when
+    /// the directory holds none.
+    static func imported(in dir: URL) -> Entry? {
+        describe(namesIn: dir)
             .filter { $0.name.lowercased().hasSuffix(".ipa") }
             .map { (name, url, attrs) in
                 Entry(source: .custom, channel: .stable, url: url,
@@ -1692,10 +1704,10 @@ enum IPALibrary {
         case notAnIPA
     }
 
-    /// Replaces the custom import with `url`, forcing a `.ipa` extension.
+    /// Replaces the import in `dir` with `url`, forcing a `.ipa` extension.
     /// Blocking. Copies to a staging directory first, so only a complete, valid
     /// IPA replaces the old one. The caller handles security-scoped access.
-    static func replaceCustomImport(with url: URL) throws -> URL {
+    static func replaceCustomImport(with url: URL, into dir: URL = IPALibrary.customDir) throws -> URL {
         let fm = FileManager.default
         let name = url.deletingPathExtension().lastPathComponent
         let staging = fm.temporaryDirectory
@@ -1708,9 +1720,9 @@ enum IPALibrary {
         guard looksLikeIPA(staged) else { throw ImportError.notAnIPA }
 
         // One import at a time, so "the custom IPA" stays unambiguous.
-        try? fm.removeItem(at: customDir)
-        try fm.createDirectory(at: customDir, withIntermediateDirectories: true)
-        let dest = customDir.appendingPathComponent(name).appendingPathExtension("ipa")
+        try? fm.removeItem(at: dir)
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        let dest = dir.appendingPathComponent(name).appendingPathExtension("ipa")
         // Same volume as the staging dir, so this is a rename, not a second copy.
         try fm.moveItem(at: staged, to: dest)
         return dest

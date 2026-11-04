@@ -405,6 +405,27 @@ instructions, Cancel ending the host, and a second run starting cleanly. The PIN
 exchange and the tunnel need a second iPhone; the reporter ran the same mechanism
 (pairable host → RPPairing tunnel → RSD → install) end to end on two iOS 27 iPhones.
 
+#### Side by Side: which app installs
+
+`SideBySideApp` chooses between SideInstaller's own release (`releaseIPA`, fetched
+from GitHub during the run) and an IPA picked on the page. Only the download and
+signing steps change; pairing, sign-in and the AFC install are the same either
+way. A chosen IPA stages in `Documents/SideBySide` (`IPALibrary.peerDir`), apart
+from the Install tab's `Documents/Custom`, so neither overwrites the other, and
+re-reads itself at launch, so the pick survives a retry and an app relaunch. It
+arrives from the Files picker or from a pasted link, both through `Engine.copyImport`,
+which validates with `looksLikeIPA` on a staged copy before replacing the old pick.
+
+Signing keeps SideInstaller's own rule (the release passes `memory_limit` 0 and no
+bundled pairing file) and otherwise follows the Install tab: a chosen IPA passes
+`memory_limit` 2, or 1 with `app_group` 0 when its bundle id is Madeira's, which
+renews its own profile. A chosen IPA is never handed this iPhone's pairing file —
+that record is ours, and only AltStore reads one.
+
+What the page says out loud: an app chosen here can't renew itself on their iPhone.
+Only SideInstaller pairs itself afterwards, so a phone with nothing on it yet wants
+the release first.
+
 #### The pairing Live Activity
 
 Pairing this iPhone means typing a code SideInstaller shows into a prompt in
@@ -615,8 +636,9 @@ refuses, the app is signed without it. SideStore, LiveContainer+SideStore,
 AltStore and StikStore are left out: they refresh themselves, and the App ID
 SideStore registers each week doesn't get the capability on a free team
 (SideStore issue #1616), so their next profiles would grant less than they're
-signed with. Madeira passes 1 (required), Side by Side 0. See the vendored
-isideload README, change 13.
+signed with. Madeira passes 1 (required). Side by Side passes 0 for its own
+release, and follows this same rule for an IPA chosen on its page: 2, or 1 with
+no app group for Madeira. See the vendored isideload README, change 13.
 
 **idevice version coexistence:** isideload pulls idevice **0.1.61** (crates.io,
 behind its `install` feature, which is required because its feature-gating is

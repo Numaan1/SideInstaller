@@ -1,0 +1,82 @@
+name: build-test-ipa
+
+# Fork-side helper: build the unsigned IPA on GitHub's macOS runner and keep it
+# as a run artifact. Nothing is released, nothing is signed, nothing is sent to
+# the signer — this is the build only, for testing a modified source.
+#
+#   gh workflow run build-test-ipa.yml --ref <branch>
+#   gh run watch
+#   gh run download -n SideInstaller-unsigned
+#
+# The IPA it makes is unsigned, so it installs the way any custom IPA does:
+# SideInstaller's Install tab › Custom .ipa › import it, and it signs and
+# installs with the Apple ID on that phone.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bundle_id:
+        description: "Bundle id to build with (the published one is com.frizzlem.sideinstaller)"
+        required: false
+        type: string
+        default: com.frizzlem.sideinstaller
+      min_ios_sdk:
+        description: "Oldest iOS SDK to build with; the script's own floor is 27.1"
+        required: false
+        type: string
+        default: "18.0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-test-ipa
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build the unsigned IPA
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Which Xcode the runner defaults to, and what it can build against.
+      # Built with a 27.1- SDK, the iPhone Duo shows the app in a window beside
+      # its status bar instead of across the whole screen — worth knowing, but
+      # not worth refusing a test build over, so min_ios_sdk sets the floor.
+      - name: Show the toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          echo "iOS SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
+          ls -d /Applications/Xcode*.app
+          rustc --version
+          cargo --version
+
+      - name: Install build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v xcodegen >/dev/null || brew install xcodegen
+          rustup target add aarch64-apple-ios
+          xcodegen --version
+
+      - name: Build the IPA
+        shell: bash
+        env:
+          BUNDLE_ID: ${{ inputs.bundle_id }}
+          MIN_IOS_SDK: ${{ inputs.min_ios_sdk }}
+          OUTPUT: ${{ runner.temp }}/SideInstaller.ipa
+          DERIVED_DATA: ${{ runner.temp }}/DerivedData
+        run: bash scripts/build-ipa.sh
+
+      - name: Upload the unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: SideInstaller-unsigned
+          path: ${{ runner.temp }}/SideInstaller.ipa
+          if-no-files-found: error
+          retention-days: 14
